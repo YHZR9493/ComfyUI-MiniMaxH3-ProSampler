@@ -1,13 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 09e72d4c58846940799b7b3554886ffa_d29ebb0696d111f18b5d525400e6dd8f
-    ReservedCode1: 5rYpBq0Y7kt9DpPS/DIZVq3nrqMZbhgo0ygzoOyZOCEjGuveRds9OHOWobH/D//ipLgJUOERLsFCIFfAuCKgVrt/vm+veZ0Knz/FqVPgqr/p7kh0Pysq3sYmhKsV1EXOOlQVz3iNTZvy57qEIEX4zfsKLNamiNJaZssLOZKmTsxuGksXD7KHsVJMguo=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 09e72d4c58846940799b7b3554886ffa_d29ebb0696d111f18b5d525400e6dd8f
-    ReservedCode2: 5rYpBq0Y7kt9DpPS/DIZVq3nrqMZbhgo0ygzoOyZOCEjGuveRds9OHOWobH/D//ipLgJUOERLsFCIFfAuCKgVrt/vm+veZ0Knz/FqVPgqr/p7kh0Pysq3sYmhKsV1EXOOlQVz3iNTZvy57qEIEX4zfsKLNamiNJaZssLOZKmTsxuGksXD7KHsVJMguo=
----
 
 # ComfyUI-MiniMaxH3-ProSampler
 
