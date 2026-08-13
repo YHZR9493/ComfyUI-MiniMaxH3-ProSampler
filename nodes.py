@@ -20,6 +20,7 @@ import comfy.sample
 import comfy.samplers
 import comfy.utils
 import comfy.model_management
+import comfy.model_sampling
 from comfy.nested_tensor import NestedTensor
 from comfy_api.latest import io, ComfyExtension
 
@@ -66,6 +67,7 @@ def _sanitize_params(kwargs):
         "sampler_name": "dpmpp_2m", "scheduler": "karras",
         "blend_mode": "pyramid", "rtx_quality": "HIGH",
         "adaptive_step": True, "rtx_enable": False,
+        "ref2va_mode": False, "shift_video": 12.0, "shift_audio": 3.0,
     }
     for key, default in defaults.items():
         val = kwargs.get(key, default)
@@ -78,7 +80,7 @@ def _sanitize_params(kwargs):
         elif key == "rtx_quality":
             if val not in ("LOW", "MEDIUM", "HIGH", "ULTRA"):
                 val = default
-        elif key in ("adaptive_step", "rtx_enable"):
+        elif key in ("adaptive_step", "rtx_enable", "ref2va_mode"):
             if not isinstance(val, bool):
                 val = default if not isinstance(val, (int, float)) or not math.isfinite(float(val)) else bool(val)
         else:
@@ -90,6 +92,37 @@ def _sanitize_params(kwargs):
     if sanitized:
         logger.warning("非法参数已回退默认值: %s", {k: (str(v0), v1) for k, (v0, v1) in sanitized.items()})
     return kwargs
+
+
+def _apply_h3_shift(model, shift_video, shift_audio):
+    """克隆模型并应用 H3 sigma shift（与内置 MiniMaxH3SigmaShift 同机制）。
+
+    仅在用户显式调整 shift 时调用；默认 12.0/3.0 与模型 config 一致时不 patch，
+    避免覆盖工作流中外部 SigmaShift 节点设置的调度。
+    """
+    m = model.clone()
+
+    class ModelSamplingAdvanced(comfy.model_sampling.ModelSamplingAV, comfy.model_sampling.CONST):
+        pass
+
+    original = m.get_model_object("model_sampling")
+    ms = ModelSamplingAdvanced(m.model.model_config)
+    ms.set_parameters(shift=shift_video, audio_shift=shift_audio)
+    if hasattr(original, "noise_scale"):
+        ms.set_noise_scale(original.noise_scale)
+    m.add_object_patch("model_sampling", ms)
+    to = m.model_options.get("transformer_options", {}).copy()
+    to["minimax_h3_sigma_shift_video"] = shift_video
+    to["minimax_h3_sigma_shift_audio"] = shift_audio
+    m.model_options["transformer_options"] = to
+    return m
+
+
+def _is_ref2va_conditioning(positive):
+    """检测 conditioning 是否携带 ref2va 参考 token（MiniMaxH3ReferenceToVideo 输出）。"""
+    if not isinstance(positive, list):
+        return False
+    return any(isinstance(c, dict) and c.get("minimax_refs") for c in positive)
 
 
 class MiniMaxH3ProSampler(io.ComfyNode):
@@ -126,6 +159,10 @@ class MiniMaxH3ProSampler(io.ComfyNode):
                 # ---- 数学采样 ----
                 io.Boolean.Input("adaptive_step", default=True, tooltip="噪点敏感 sigma 预算重分配（总步数不变，算力集中到噪点段）。", advanced=True),
                 io.Float.Input("rk_tol", default=0.05, min=0.005, max=0.5, step=0.005, tooltip="局部误差容差（RK 风格）：越小精修步数越密。", advanced=True),
+                # ---- ref2va 参考生视频（位置与旧工作流保存顺序一致：rk_tol 之后、RTX 之前；改动此顺序会致旧工作流 widget 值错位）----
+                io.Boolean.Input("ref2va_mode", default=False, tooltip="ref2va 参考生视频模式：配合 MiniMaxH3ReferenceToVideo 的 conditioning/latent 使用。开启后关闭自适应 sigma 重分配，稳定参考 token 注入（官方 ref2va 链路用普通 simple 调度）。也可由节点自动识别参考条件。", advanced=True),
+                io.Float.Input("shift_video", default=12.0, min=0.01, max=100.0, step=0.01, tooltip="H3 视频流 sigma shift。默认 12.0 与模型一致（不重复 patch）；调小更锐利、调大更平滑。", advanced=True),
+                io.Float.Input("shift_audio", default=3.0, min=0.01, max=100.0, step=0.01, tooltip="H3 音频流 sigma shift。默认 3.0 与模型一致；仅当需覆盖外部 SigmaShift 节点时调整。", advanced=True),
                 # ---- RTX ----
                 io.Boolean.Input("rtx_enable", default=False, tooltip="启用 RTX 视频超分高清化（需连接 VAE）。"),
                 io.Float.Input("rtx_scale", default=2.0, min=1.0, max=4.0, step=0.01, advanced=True),
@@ -161,6 +198,9 @@ class MiniMaxH3ProSampler(io.ComfyNode):
         adaptive_step=True,
         k_cfg=0.5,
         rk_tol=0.05,
+        ref2va_mode=False,
+        shift_video=12.0,
+        shift_audio=3.0,
         rtx_enable=False,
         rtx_scale=2.0,
         rtx_quality="HIGH",
@@ -174,17 +214,46 @@ class MiniMaxH3ProSampler(io.ComfyNode):
             refine_sigma_start=refine_sigma_start, blend_mode=blend_mode,
             adaptive_step=adaptive_step, rk_tol=rk_tol, rtx_enable=rtx_enable,
             rtx_scale=rtx_scale, rtx_quality=rtx_quality,
+            ref2va_mode=ref2va_mode, shift_video=shift_video, shift_audio=shift_audio,
         ))
         seed, steps, sampler_name, scheduler = p["seed"], p["steps"], p["sampler_name"], p["scheduler"]
         noise_threshold, tile_size, tile_overlap = p["noise_threshold"], p["tile_size"], p["tile_overlap"]
         motion_sensitivity, refine_steps, refine_sigma_start = p["motion_sensitivity"], p["refine_steps"], p["refine_sigma_start"]
         blend_mode, adaptive_step, rk_tol = p["blend_mode"], p["adaptive_step"], p["rk_tol"]
         rtx_enable, rtx_scale, rtx_quality = p["rtx_enable"], p["rtx_scale"], p["rtx_quality"]
+        ref2va_mode, shift_video, shift_audio = p["ref2va_mode"], p["shift_video"], p["shift_audio"]
         if kwargs.get("negative") is not None:
             logger.info("忽略旧工作流残留的 negative 输入（端口已移除，CFG 固定 1.0）")
         lat = latent_image["samples"]
         is_nested = isinstance(lat, NestedTensor)
         load_dev = model.load_device
+
+        # ---- 0. ref2va 参考生视频适配 ----
+        # ref2va checkpoint 必须携带参考 token 条件（MiniMaxH3ReferenceToVideo 输出）。
+        # 检测到参考条件或手动开启 ref2va_mode 时关闭自适应 sigma 重分配，
+        # 与官方 ref2va 链路（simple 调度）保持一致，稳定参考 token 注入时机。
+        is_ref2va = ref2va_mode or _is_ref2va_conditioning(positive)
+        if ref2va_mode and not _is_ref2va_conditioning(positive):
+            logger.warning(
+                "ref2va_mode=True 但 positive 中未检测到参考 token（minimax_refs）。"
+                "请确认参考图/视频已通过 MiniMaxH3ReferenceToVideo 的 ref_images/ref_videos "
+                "或 MiniMaxH3ImageToVideo 的 first_frame 注入；否则 ref2va 模型在无参考时画面会糊。"
+            )
+        use_adaptive = adaptive_step and not is_ref2va
+        if is_ref2va and adaptive_step:
+            logger.info("ref2va 模式：关闭自适应 sigma 重分配，使用模型原生调度")
+        # 用户显式调整 shift 时总是 patch 模型；ref2va 模式下若模型尚未被外部
+        # MiniMaxH3SigmaShift patch（transformer_options 无 minimax_h3_sigma_shift_video），
+        # 也用默认 12.0/3.0 自动补上，避免漏接 SigmaShift 节点导致 sigma 调度不匹配。
+        to_opts = model.model_options.get("transformer_options", {})
+        already_shifted = "minimax_h3_sigma_shift_video" in to_opts
+        need_default_shift = is_ref2va and not already_shifted
+        if abs(shift_video - 12.0) > 1e-9 or abs(shift_audio - 3.0) > 1e-9 or need_default_shift:
+            try:
+                model = _apply_h3_shift(model, shift_video, shift_audio)
+                logger.info("已应用 H3 sigma shift: video=%.2f audio=%.2f", shift_video, shift_audio)
+            except Exception:  # noqa: BLE001
+                logger.exception("H3 sigma shift patch 失败，使用模型默认调度")
 
         # ---- 1. 噪点敏感 sigma 预算重分配 + 主采样 ----
         # 已移除 negative 端口：无 CFG 引导，cfg 固定按 1.0（纯正向引导）。
@@ -208,7 +277,7 @@ class MiniMaxH3ProSampler(io.ComfyNode):
                 model_options=model.model_options,
             )
             sigmas = ks.sigmas
-            if adaptive_step and len(sigmas) >= 4:
+            if use_adaptive and len(sigmas) >= 4:
                 try:
                     sigmas = adaptive_sigmas(sigmas, max(2, len(sigmas) - 1)).to(load_dev)
                 except Exception:  # noqa: BLE001
@@ -232,7 +301,7 @@ class MiniMaxH3ProSampler(io.ComfyNode):
                 model_options=model.model_options,
             )
             sigmas = ks.sigmas
-            if adaptive_step and len(sigmas) >= 4:
+            if use_adaptive and len(sigmas) >= 4:
                 try:
                     sigmas = adaptive_sigmas(sigmas, max(2, len(sigmas) - 1)).to(load_dev)
                 except Exception:  # noqa: BLE001
@@ -282,11 +351,12 @@ class MiniMaxH3ProSampler(io.ComfyNode):
         out = dict(latent_image)
         out["samples"] = refined
 
-        # ---- 4. RTX 高清化 ----
+        # ---- 4. 视频帧输出（VAE 已连接时始终可用）----
+        # rtx_enable=True：输出 RTX 超分帧；rtx_enable=False：输出原始解码帧。
+        # 若 VAE 已连接却不输出，下游 CreateVideo/SaveVideo 会收到空视频，
+        # 报 'NoneType' object has no attribute 'shape'。
         images = None
-        if rtx_enable:
-            if vae is None:
-                raise ValueError("RTX 高清化需要连接 VAE 输入")
+        if vae is not None:
             # NestedTensor（视频+音频 latent 对）需先取视频分量再交给 VAE，
             # 否则 VAE 内部 .to(z) 收到 NestedTensor 会抛
             # TypeError: to() received an invalid combination of arguments。
@@ -294,7 +364,10 @@ class MiniMaxH3ProSampler(io.ComfyNode):
             if isinstance(decode_samples, NestedTensor):
                 decode_samples = decode_samples.unbind()[0]
             decoded = vae.decode(decode_samples)
-            images = rtx_upscale_frames(_to_frames(decoded), rtx_scale, rtx_quality)
+            frames = _to_frames(decoded)
+            images = rtx_upscale_frames(frames, rtx_scale, rtx_quality) if rtx_enable else frames
+        elif rtx_enable:
+            raise ValueError("RTX 高清化需要连接 VAE 输入")
 
         return io.NodeOutput(out, images)
 

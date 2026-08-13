@@ -6,3 +6,8 @@
 debug.log
 *.log
 
+# 本地备份文件
+temp/
+*.bak
+*.bak_*
+
