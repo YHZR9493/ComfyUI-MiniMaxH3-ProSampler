@@ -2,3 +2,7 @@
 *.pyc
 *.pyo
 
+
+debug.log
+*.log
+
